@@ -60,6 +60,11 @@ pub struct LocalCodex {
     home: Directory,
     codex: Directory,
     path: Option<OsString>,
+    /// The operator's model-gateway key, captured from the service's own
+    /// environment at construction (like `path`). Agent configs address a
+    /// key-based provider through `env_key = "LITELLM_API_KEY"`; `apply`
+    /// provides exactly that variable to the child and nothing else.
+    gateway_key: Option<OsString>,
 }
 impl LocalCodex {
     pub fn new(
@@ -77,9 +82,15 @@ impl LocalCodex {
             home: Directory::open(home)?,
             codex: Directory::open(codex_home)?,
             path: std::env::var_os("PATH"),
+            gateway_key: std::env::var_os("LITELLM_API_KEY"),
         };
         value.check()?;
         Ok(value)
+    }
+    #[cfg(test)]
+    fn with_gateway_key_for_test(mut self, key: Option<OsString>) -> Self {
+        self.gateway_key = key;
+        self
     }
     pub(crate) fn check(&self) -> Result<(), Failure> {
         self.home.check()?;
@@ -169,6 +180,13 @@ impl LocalCodex {
         if let Some(path) = &self.path {
             environment.insert("PATH".into(), path.clone());
         }
+        // The operator's model-gateway key (captured at construction, see
+        // field docs). Wholesale inheritance stays refused; without this
+        // bridge every key-addressed provider fails with
+        // "Missing environment variable".
+        if let Some(value) = &self.gateway_key {
+            environment.insert("LITELLM_API_KEY".into(), value.clone());
+        }
         Ok(())
     }
     pub(crate) async fn watch<T>(
@@ -218,11 +236,10 @@ mod tests {
             environment.get(&OsString::from("CODEX_HOME")),
             Some(&codex.clone().into_os_string())
         );
-        assert!(
-            environment
-                .keys()
-                .all(|key| matches!(key.to_str(), Some("HOME" | "CODEX_HOME" | "PATH")))
-        );
+        assert!(environment.keys().all(|key| matches!(
+            key.to_str(),
+            Some("HOME" | "CODEX_HOME" | "PATH" | "LITELLM_API_KEY")
+        )));
         environment.insert("OPENAI_API_KEY".into(), "synthetic-forbidden".into());
         assert!(binding.apply(&mut environment).is_err());
         assert_eq!(
@@ -254,5 +271,37 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_local_codex_binding_passes_gateway_key() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let codex = root.join("codex");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&codex).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Hermetic: force the key absent regardless of the test runner env.
+        let binding = LocalCodex::new("pool".into(), "seat".into(), home.clone(), codex.clone())
+            .unwrap()
+            .with_gateway_key_for_test(None);
+        let mut environment = BTreeMap::new();
+        binding.apply(&mut environment).unwrap();
+        assert!(!environment.contains_key(OsString::from("LITELLM_API_KEY").as_os_str()));
+        // With the key captured, it is passed through verbatim and nothing
+        // else is inherited.
+        let binding = binding.with_gateway_key_for_test(Some(OsString::from("test-gateway-key")));
+        let mut environment = BTreeMap::new();
+        binding.apply(&mut environment).unwrap();
+        assert_eq!(
+            environment.get(OsString::from("LITELLM_API_KEY").as_os_str()),
+            Some(&OsString::from("test-gateway-key"))
+        );
+        assert!(environment.keys().all(|key| matches!(
+            key.to_str(),
+            Some("HOME" | "CODEX_HOME" | "PATH" | "LITELLM_API_KEY")
+        )));
     }
 }
