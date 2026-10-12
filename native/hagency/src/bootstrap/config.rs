@@ -384,6 +384,18 @@ pub(super) fn matrix_root(state: &Path) -> Result<Option<Vec<u8>>, Failure> {
         }
     }
 }
+/// The operator's Codex configuration belongs to the service runtime home.
+/// Managed agent homes are seeded with a copy, so a dispatched agent reads
+/// the same provider configuration as the service's own Codex sessions.
+/// An absent file keeps the sign-in behavior; an invalid or unreadable
+/// file must not silently fall back to no configuration.
+pub(super) fn codex_config(state: &Path) -> Result<Option<Vec<u8>>, Failure> {
+    let path = state.join("runtime-home/config.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read(&path, 64 * 1024, "runtime-home/config.toml").map(Some),
+    }
+}
 /// Fixed-memory digest under trusted executable/ancestor provisioning. This is
 /// not handle-based executable launch or a claim of hostile namespace isolation.
 fn verify_executable(path: &Path, expected: &str) -> Result<(), Failure> {
@@ -973,7 +985,8 @@ impl Prepared {
                     .map_err(|_| Failure::Config {
                         field: "agent-driver.json: token_provisioning home",
                         fix: "root, projects and task_client must form a valid managed home plan",
-                    })?;
+                    })?
+                    .with_codex_config(codex_config(state)?);
                     host = host.with_managed_homes(plan).map_err(|_| Failure::Config {
                         field: "agent-driver.json: token_provisioning home",
                         fix: "the provisioning host must accept the managed home plan",
@@ -1441,7 +1454,8 @@ pub(super) fn load_fleet_runtime(
     .map_err(|_| Failure::Config {
         field: "fleet-runtime.json: home",
         fix: "the home root, task client and at most 16 projects must form a managed home plan",
-    })?;
+    })?
+    .with_codex_config(codex_config(state)?);
     Ok(FleetRuntime {
         warm,
         homes,
