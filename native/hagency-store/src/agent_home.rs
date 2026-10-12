@@ -142,6 +142,9 @@ pub struct ManagedHomePlan {
     root: Arc<Root>,
     sources: BTreeMap<String, Arc<Source>>,
     binary: Arc<Binary>,
+    /// Operator Codex configuration seeded into each newly created Codex
+    /// home as `config.toml`; None keeps the sign-in-only behavior.
+    codex_config: Option<Arc<[u8]>>,
     jobs: Mutex<BTreeMap<String, Arc<Job>>>,
 }
 struct Job {
@@ -314,8 +317,18 @@ impl ManagedHomePlan {
             root,
             sources,
             binary,
+            codex_config: None,
             jobs: Mutex::new(BTreeMap::new()),
         })
+    }
+    /// Seed every newly created Codex home with the operator's Codex
+    /// configuration (the service runtime home's `config.toml`), so a
+    /// dispatched agent reads the same provider configuration as the
+    /// service's own Codex sessions. Existing homes are never rewritten;
+    /// without this, provisioning behavior is unchanged.
+    pub fn with_codex_config(mut self, config: Option<Vec<u8>>) -> Self {
+        self.codex_config = config.map(Into::into);
+        self
     }
     /// Host credential/SDK custody must not be a project or managed home tree.
     pub fn separate_from(&self, path: &Path) -> Result<(), Error> {
@@ -478,6 +491,7 @@ impl ManagedHomePlan {
             .map_err(|_| Error::Busy)?;
         let root = self.root.clone();
         let binary = self.binary.clone();
+        let codex_config = self.codex_config.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let result = async {
@@ -515,6 +529,7 @@ impl ManagedHomePlan {
                         root,
                         source,
                         binary,
+                        codex_config,
                         request,
                         resource,
                         binding,
@@ -554,6 +569,7 @@ struct Creation {
     root: Arc<Root>,
     source: Option<Arc<Source>>,
     binary: Arc<Binary>,
+    codex_config: Option<Arc<[u8]>>,
     request: ProjectRequest,
     resource: project::Resource,
     binding: String,
@@ -566,6 +582,7 @@ fn create(creation: Creation) -> Result<Arc<ManagedAgentHome>, Error> {
         root,
         source,
         binary,
+        codex_config,
         request,
         resource,
         binding,
@@ -701,6 +718,17 @@ fn create(creation: Creation) -> Result<Arc<ManagedAgentHome>, Error> {
         private::write_new(&workdir.join("task-writer.cmd"), wrapper.as_bytes())?;
     }
     private::write_new(&home.join("agent.json"), &bytes)?;
+    // Seed the operator's Codex configuration into the new home. Codex
+    // reads only its own CODEX_HOME, so without this file a dispatched
+    // agent silently falls back to the built-in provider instead of the
+    // service's configured one. The home manifest seals `agent.json`
+    // alone, so this file is outside the manifest by design.
+    if resource.framework == "codex"
+        && let Some(config) = &codex_config
+    {
+        checkpoint(deadline, cancel)?;
+        private::write_new(&home.join("config.toml"), config)?;
+    }
     let project_root = match source.as_ref().map(|s| s.mode) {
         Some(ProjectMode::Copy) => Some(Root::open(project_path.clone(), true)?),
         Some(ProjectMode::Symlink) | None => None,
