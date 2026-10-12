@@ -398,6 +398,130 @@ async fn native_managed_home_for_a_project_without_a_configured_source() {
     assert!(plan().reopen(&scope, &rebuilt, &registered).is_err());
 }
 
+/// Operator Codex configuration seeded at provision time must land in the
+/// new agent home verbatim, and its presence must not trip the home
+/// manifest checks when the home is reopened after a restart.
+#[tokio::test]
+async fn native_managed_home_seeds_operator_codex_config() {
+    use hagency_store::agent_home::{HomeProject, ManagedHomePlan, ProjectMode};
+    const CODEX_CONFIG: &[u8] = b"model = \"qwen3-27b-xpu\"\nmodel_provider = \"litellm\"\n\n[model_providers.litellm]\nbase_url = \"http://127.0.0.1:8080/v1\"\nenv_key = \"LITELLM_API_KEY\"\nwire_api = \"responses\"\n";
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let homes = root.path().join("homes");
+    hagency_store::private::directory(&homes).unwrap();
+    let project = root.path().join("source-project");
+    hagency_store::private::directory(&project).unwrap();
+    let bin = root.path().join("bin");
+    hagency_store::private::directory(&bin).unwrap();
+    let binary = bin.join("hagency");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let binary = binary.canonicalize().unwrap();
+    let plan = || {
+        ManagedHomePlan::new(
+            homes.canonicalize().unwrap(),
+            vec![HomeProject {
+                project_id: "project_configured_at_startup".into(),
+                source: project.canonicalize().unwrap(),
+                mode: ProjectMode::Copy,
+            }],
+            binary.clone(),
+        )
+        .unwrap()
+        .with_codex_config(Some(CODEX_CONFIG.to_vec()))
+    };
+    let mut db = DomainRepository::open(&state).unwrap();
+    let pool = resource("pool", "seat", 1000);
+    let effect = provision(&mut db, &pool);
+    let scope = db
+        .provision_runtime_scope(&effect, &registration())
+        .unwrap();
+    let domain = DomainStore::start(db, 16).unwrap();
+    let created = plan()
+        .materialize(
+            domain.clone(),
+            effect.clone(),
+            registration(),
+            Instant::now() + Duration::from_secs(10),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    let home = created.home_path().unwrap();
+    assert_eq!(
+        std::fs::read(home.join("config.toml")).unwrap(),
+        CODEX_CONFIG
+    );
+    scope.claim_warm().unwrap();
+    domain.complete_original_provision(scope).await.unwrap();
+    drop(created);
+    domain.shutdown().await.unwrap();
+    // The seeded home reopens after a restart: `config.toml` is outside
+    // the sealed manifest, so the recorded binding checks still pass.
+    let mut db = DomainRepository::open(&state).unwrap();
+    let (rebuilt, registered, scope) = db.reattach_provision_scope(&effect.engagement_id).unwrap();
+    let reopened = plan().reopen(&scope, &rebuilt, &registered).unwrap();
+    assert_eq!(reopened.home_path().unwrap(), home);
+    assert_eq!(
+        std::fs::read(home.join("config.toml")).unwrap(),
+        CODEX_CONFIG
+    );
+}
+
+/// Without operator configuration the provisioning behavior is unchanged:
+/// no `config.toml` is invented for the new home.
+#[tokio::test]
+async fn native_managed_home_without_operator_codex_config_seeds_nothing() {
+    use hagency_store::agent_home::{HomeProject, ManagedHomePlan, ProjectMode};
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let homes = root.path().join("homes");
+    hagency_store::private::directory(&homes).unwrap();
+    let project = root.path().join("source-project");
+    hagency_store::private::directory(&project).unwrap();
+    let bin = root.path().join("bin");
+    hagency_store::private::directory(&bin).unwrap();
+    let binary = bin.join("hagency");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let binary = binary.canonicalize().unwrap();
+    let plan = ManagedHomePlan::new(
+        homes.canonicalize().unwrap(),
+        vec![HomeProject {
+            project_id: "project_configured_at_startup".into(),
+            source: project.canonicalize().unwrap(),
+            mode: ProjectMode::Copy,
+        }],
+        binary.clone(),
+    )
+    .unwrap();
+    let mut db = DomainRepository::open(&state).unwrap();
+    let pool = resource("pool", "seat", 1000);
+    let effect = provision(&mut db, &pool);
+    let domain = DomainStore::start(db, 16).unwrap();
+    let created = plan
+        .materialize(
+            domain.clone(),
+            effect.clone(),
+            registration(),
+            Instant::now() + Duration::from_secs(10),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    let home = created.home_path().unwrap();
+    assert!(!home.join("config.toml").exists());
+    domain.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn native_managed_home_reopens_after_a_restart() {
     use hagency_store::agent_home::{HomeProject, ManagedHomePlan, ProjectMode};
